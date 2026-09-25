@@ -1,0 +1,9 @@
+# Binary: never convert line endings (PDF byte offsets break otherwise).
+*.pdf binary
+*.png binary
+*.db binary
+
+# Shell-parsed files must keep LF even when checked out on Windows.
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
