@@ -1,0 +1,27 @@
+[project]
+name = "research-assistant"
+version = "0.3.0"
+description = "Agentic research assistant over uploaded documents and the web, with verified citations"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "RUF001",  # typographic quotes/dashes in prompt strings are intentional
+    "RUF002",
+    "RUF003",
+    "SIM105",  # try/except/pass reads fine for best-effort cleanup
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent", "web", "eval", "fakes"]
