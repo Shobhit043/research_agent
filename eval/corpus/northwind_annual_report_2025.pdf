@@ -1,0 +1,65 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R] /Count 4 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 356 >>
+stream
+BT /F1 12 Tf 72 720 Td 14 TL (Northwind Robotics - Annual Report 2025) Tj T* (Letter from the CEO, Maria Okafor) Tj T* () Tj T* (2025 was our strongest year yet. Revenue reached 612 million USD,) Tj T* (up 23 percent from 498 million USD in 2024. Net income was 41 million USD.) Tj T* (We shipped 3,900 autonomous picking robots to 210 customers.) Tj T* ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 342 >>
+stream
+BT /F1 12 Tf 72 720 Td 14 TL (Business segments) Tj T* () Tj T* (Warehouse automation contributed 58 percent of revenue and grew 31 percent.) Tj T* (Agricultural drones contributed 27 percent of revenue.) Tj T* (Service contracts contributed the remaining 15 percent.) Tj T* (Our largest customer accounted for 9 percent of revenue.) Tj T* ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 337 >>
+stream
+BT /F1 12 Tf 72 720 Td 14 TL (People and investment) Tj T* () Tj T* (Headcount was 2,140 employees at year end, up from 1,780 a year earlier.) Tj T* (Research and development spending was 94 million USD, about 15 percent of revenue.) Tj T* (A new manufacturing plant in Monterrey, Mexico will open in the third quarter of 2026.) Tj T* ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<< /Length 358 >>
+stream
+BT /F1 12 Tf 72 720 Td 14 TL (Risks and outlook) Tj T* () Tj T* (Our main supply chain risk is dependence on a single lidar supplier, Veltrix,) Tj T* (which provides about 70 percent of our sensors.) Tj T* (Other risks include import tariffs and a shortage of skilled technicians.) Tj T* (For 2026 we expect revenue between 700 and 740 million USD.) Tj T* ET
+endstream
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000134 00000 n 
+0000000204 00000 n 
+0000000330 00000 n 
+0000000737 00000 n 
+0000000863 00000 n 
+0000001256 00000 n 
+0000001382 00000 n 
+0000001770 00000 n 
+0000001898 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+2308
+%%EOF
