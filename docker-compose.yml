@@ -1,0 +1,33 @@
+services:
+  assistant:
+    build: .
+    image: research-assistant:latest
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      # Set APP_API_KEYS in .env before exposing this beyond localhost.
+      DATABASE_URL: postgresql://assistant:${POSTGRES_PASSWORD:-assistant}@db:5432/assistant
+      LOG_FORMAT: json
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: assistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-assistant}
+      POSTGRES_DB: assistant
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U assistant -d assistant"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
