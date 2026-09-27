@@ -63,6 +63,7 @@ Your chat and documents are saved on the server and restored when you reload the
 | [Deployment](docs/deployment.md) | Docker, PostgreSQL, security checklist, monitoring, troubleshooting |
 | [Evaluation](docs/evaluation.md) | Methodology, results and how to run the harness |
 | [Development](docs/development.md) | Project layout, tests, adding a tool, conventions |
+| [Codebase guide](docs/codebase-guide.md) | The complete walkthrough: every flow (startup, upload, question), the agent graph, retrieval, tools, citations, storage, security, failure handling and key numbers |
 
 ## Tech stack
 
