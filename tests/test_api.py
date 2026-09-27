@@ -5,6 +5,7 @@ import groq
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.documents import Document
 
 import web.server as server
 from agent.schemas import QueryAnalysis
@@ -22,6 +23,15 @@ def reset_postgres(url: str) -> None:
         conn.execute("DROP TABLE IF EXISTS chunks, turns, sessions CASCADE")
 
 
+def pgvector_available(url: str | None) -> bool:
+    if not url:
+        return False
+    import psycopg
+
+    with psycopg.connect(url, autocommit=True) as conn:
+        return conn.execute("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'").fetchone() is not None
+
+
 class Harness:
     """Builds apps over one database, so a 'restart' is just a new app on the same DB."""
 
@@ -32,9 +42,11 @@ class Harness:
         self.agents: list = []
         self.apps: list = []
 
-    def factory(self, session_id):
+    def factory(self, session_id, storage):
         agent, _ = make_agent(self.replies, with_docs=False)
         agent.store._embedder = KeywordEmbedder()
+        if storage.vector_search_enabled:
+            agent.store._vector_search = lambda query, k: storage.vector_search(session_id, query, k)
         agent.session_id = session_id
         self.agents.append(agent)
         return agent
@@ -55,7 +67,9 @@ class Harness:
     "sqlite",
     pytest.param("postgres", marks=pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set")),
 ])
-def harness(request, tmp_path):
+def harness(request, tmp_path, monkeypatch):
+    # KeywordEmbedder produces 4-dimensional vectors; pgvector's column must match.
+    monkeypatch.setenv("EMBEDDING_DIM", "4")
     database_url = None
     if request.param == "postgres":
         reset_postgres(TEST_DATABASE_URL)
@@ -135,7 +149,7 @@ def test_upload_indexes_file_and_strips_path_from_name(client, session, make_pdf
     response = upload(client, session, "../../secret/Report 2025.pdf", pdf)
 
     assert response.status_code == 201
-    assert response.json()["documents"] == [{"name": "Report 2025.pdf", "chunks": 1}]
+    assert response.json()["documents"] == [{"name": "Report 2025.pdf", "chunks": 1, "ocr": False}]
     assert client.get(f"/api/sessions/{session}/documents").json() == response.json()
 
 
@@ -261,7 +275,7 @@ def test_session_survives_restart_with_history_documents_and_vectors(harness, ma
     restarted = harness.client()
     info = restarted.get(f"/api/sessions/{session}").json()
 
-    assert info["documents"] == [{"name": "report.pdf", "chunks": 1}]
+    assert info["documents"] == [{"name": "report.pdf", "chunks": 1, "ocr": False}]
     assert [t["question"] for t in info["turns"]] == ["hi"]
     assert info["turns"][0]["result"]["answer"] == "Hello!"
     assert info["tokens_used"] > 0
@@ -374,3 +388,79 @@ def test_database_from_before_attachments_is_migrated(tmp_path):
     storage = SQLiteStorage(db)
 
     assert storage.list_turns("s1") == [{"question": "old", "result": {}, "attachments": []}]
+
+
+# ----- pgvector -----
+
+needs_pgvector = pytest.mark.skipif(
+    not pgvector_available(TEST_DATABASE_URL), reason="needs TEST_DATABASE_URL with the pgvector extension"
+)
+
+
+@needs_pgvector
+def test_pgvector_serves_semantic_search_and_survives_restart(tmp_path, monkeypatch, make_pdf):
+    monkeypatch.setenv("EMBEDDING_DIM", "4")
+    reset_postgres(TEST_DATABASE_URL)
+    harness = Harness(tmp_path, TEST_DATABASE_URL)
+    try:
+        client = harness.client()
+        assert client.get("/api/health").json()["vector_search"] == "pgvector"
+        session = client.post("/api/sessions").json()["session_id"]
+        upload(client, session, "report.pdf", make_pdf("r.pdf", [
+            "Quarterly sales climbed sharply in Europe", "The office moved to a new building",
+        ]).read_bytes())
+
+        restarted = harness.client()
+        restarted.get(f"/api/sessions/{session}")
+        store = harness.agents[-1].store
+
+        assert store._index.vectors is None, "with pgvector, restored sessions hold no vectors in memory"
+        assert store.hybrid
+        hits = store.search("how much did turnover rise", k=1)  # no keyword overlap: dense only
+        assert hits and hits[0][0].metadata["page"] == 1
+    finally:
+        harness.close()
+
+
+@needs_pgvector
+def test_pgvector_backfills_vectors_stored_before_it_was_enabled(tmp_path, monkeypatch, make_pdf):
+    from web.storage import PostgresStorage
+
+    reset_postgres(TEST_DATABASE_URL)
+    plain = PostgresStorage(TEST_DATABASE_URL, embedding_dim=4, use_pgvector=False)
+    plain.create_session("s1", "anonymous")
+    chunks = [Document(page_content="sales grew", metadata={"source": "a.md", "page": None, "chunk_id": "a.md#0"})]
+    plain.replace_document("s1", "a.md", chunks, KeywordEmbedder().embed_documents(["sales grew"]))
+    plain.close()
+
+    upgraded = PostgresStorage(TEST_DATABASE_URL, embedding_dim=4)
+    try:
+        assert upgraded.vector_search_enabled
+        [(chunk_id, similarity)] = upgraded.vector_search("s1", KeywordEmbedder().embed_query("revenue"), k=5)
+        assert chunk_id == "a.md#0" and similarity > 0.9
+    finally:
+        upgraded.close()
+
+
+@needs_pgvector
+def test_pgvector_refuses_mismatched_dimensions(tmp_path):
+    from web.storage import PostgresStorage
+
+    reset_postgres(TEST_DATABASE_URL)
+    PostgresStorage(TEST_DATABASE_URL, embedding_dim=4).close()
+
+    other_model = PostgresStorage(TEST_DATABASE_URL, embedding_dim=384)
+    try:
+        assert not other_model.vector_search_enabled, "falls back to in-memory search instead of failing"
+    finally:
+        other_model.close()
+
+
+def test_image_upload_is_ocrd_and_flagged(client, session, fake_ocr):
+    fake_ocr.text = "Receipt total 42 EUR"
+
+    response = upload(client, session, "receipt.png", b"\x89PNG fake", "image/png")
+
+    assert response.status_code == 201
+    assert response.json()["documents"] == [{"name": "receipt.png", "chunks": 1, "ocr": True}]
+    assert fake_ocr.images, "the image went through OCR"

@@ -12,6 +12,8 @@ class ServerSettings:
     data_dir: Path = Path("data")
     # postgresql://user:pass@host:5432/db. Unset means SQLite at data_dir/assistant.db.
     database_url: str | None = None
+    # With Postgres, use the pgvector extension for vector search when it's installed.
+    use_pgvector: bool = True
     # Empty means no authentication (local use). Set APP_API_KEYS for any shared deployment.
     api_keys: tuple[str, ...] = ()
     cors_origins: tuple[str, ...] = ()
@@ -36,6 +38,7 @@ class ServerSettings:
         return cls(
             data_dir=Path(os.getenv("DATA_DIR", "data")),
             database_url=os.getenv("DATABASE_URL") or None,
+            use_pgvector=os.getenv("USE_PGVECTOR", "true").strip().lower() in {"1", "true", "yes", "on"},
             api_keys=_csv("APP_API_KEYS"),
             cors_origins=_csv("CORS_ORIGINS"),
             max_upload_bytes=int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024,

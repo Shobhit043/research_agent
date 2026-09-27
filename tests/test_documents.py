@@ -216,3 +216,75 @@ def test_embedding_failure_falls_back_to_keyword_search():
 
     assert not store.hybrid
     assert store.search("revenue")
+
+
+# ----- OCR -----
+
+def test_scanned_pdf_pages_are_ocrd_and_marked(make_pdf, fake_ocr):
+    fake_ocr.text = "Invoice total 4,820 USD"
+    path = make_pdf("mixed.pdf", ["A normal page with plenty of extractable text", ""])
+
+    pages = load_document(path)
+
+    assert fake_ocr.pages == [1], "only the page without a text layer is OCR'd"
+    assert pages[1].page_content == "Invoice total 4,820 USD"
+    assert pages[1].metadata == {"source": "mixed.pdf", "page": 2, "ocr": True}
+    assert "ocr" not in pages[0].metadata
+
+
+def test_ocr_page_limit_skips_the_rest(make_pdf, fake_ocr):
+    fake_ocr.text = "scanned text"
+    path = make_pdf("scan.pdf", ["", "", ""])
+
+    pages = load_document(path, ocr_max_pages=2)
+
+    assert len(fake_ocr.pages) == 2 and [p.metadata["page"] for p in pages] == [1, 2]
+
+
+def test_ocr_can_be_disabled(make_pdf, fake_ocr):
+    with pytest.raises(DocumentLoadError, match="OCR is disabled"):
+        load_document(make_pdf("scan.pdf", [""]), ocr=False)
+    assert fake_ocr.pages == []
+
+
+def test_images_are_ocrd_without_page_numbers(tmp_path, fake_ocr):
+    fake_ocr.text = "Whiteboard   notes"
+    image = tmp_path / "board.png"
+    image.write_bytes(b"not really a png; the fake OCR doesn't care")
+
+    [doc] = load_document(image)
+
+    assert doc.page_content == "Whiteboard notes"
+    assert doc.metadata == {"source": "board.png", "page": None, "ocr": True}
+
+
+def test_image_with_no_text_is_rejected(tmp_path, fake_ocr):
+    image = tmp_path / "blank.jpg"
+    image.write_bytes(b"x")
+
+    with pytest.raises(DocumentLoadError, match="No readable text"):
+        load_document(image)
+
+
+@pytest.mark.real_ocr
+def test_real_ocr_reads_a_scanned_pdf(tmp_path):
+    pytest.importorskip("rapidocr_onnxruntime")
+    pytest.importorskip("pypdfium2")
+    from PIL import Image, ImageDraw, ImageFont
+
+    picture = Image.new("RGB", (1240, 400), "white")
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 44)
+    except OSError:
+        try:
+            font = ImageFont.truetype("arial.ttf", 44)
+        except OSError:
+            font = ImageFont.load_default(size=44)
+    ImageDraw.Draw(picture).text((60, 120), "Total due: 4,820 USD", fill="black", font=font)
+    path = tmp_path / "scan.pdf"
+    picture.save(path)  # an image-only PDF, like a scanner produces
+
+    [page] = load_document(path)
+
+    assert page.metadata["ocr"] is True
+    assert "4,820" in page.page_content

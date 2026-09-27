@@ -33,6 +33,11 @@ class Settings:
     use_embeddings: bool = True
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
+    ocr_enabled: bool = True
+    ocr_max_pages: int = 30
+    # Must match the embedding model; it fixes the pgvector column size.
+    embedding_dim: int = 384
+
     # Empty means every tool. Each bound tool costs ~150 prompt tokens per model call.
     enabled_tools: tuple[str, ...] = ()
 
@@ -42,5 +47,8 @@ class Settings:
             model=os.getenv("AGENT_MODEL", cls.model),
             use_embeddings=env_bool("USE_EMBEDDINGS", cls.use_embeddings),
             embedding_model=os.getenv("EMBEDDING_MODEL", cls.embedding_model),
+            ocr_enabled=env_bool("OCR_ENABLED", cls.ocr_enabled),
+            ocr_max_pages=int(os.getenv("OCR_MAX_PAGES", str(cls.ocr_max_pages))),
+            embedding_dim=int(os.getenv("EMBEDDING_DIM", str(cls.embedding_dim))),
             enabled_tools=tuple(t.strip() for t in os.getenv("ENABLED_TOOLS", "").split(",") if t.strip()),
         )

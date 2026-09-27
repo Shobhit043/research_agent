@@ -2,6 +2,7 @@ import logging
 import math
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -20,6 +21,9 @@ _STOPWORDS = frozenset([
 # Reciprocal rank fusion constant from Cormack et al. (2009); 60 is the standard choice.
 RRF_K = 60
 _DENSE_CANDIDATES = 20
+
+# (query vector, k) -> [(chunk_id, similarity)], e.g. a pgvector query scoped to one session.
+VectorSearch = Callable[[np.ndarray, int], list[tuple[str, float]]]
 
 
 def tokenize(text: str) -> list[str]:
@@ -59,8 +63,16 @@ class DocumentStore:
     embedder, or if embedding fails, it degrades to BM25 only.
     """
 
-    def __init__(self, embedder: Embedder | None = None, k1: float = 1.5, b: float = 0.75):
+    def __init__(
+        self,
+        embedder: Embedder | None = None,
+        vector_search: VectorSearch | None = None,
+        k1: float = 1.5,
+        b: float = 0.75,
+    ):
         self._embedder = embedder
+        # When set, dense ranking is delegated (to pgvector) instead of using in-memory vectors.
+        self._vector_search = vector_search
         self._k1 = k1
         self._b = b
         self._index = _Index()
@@ -70,7 +82,9 @@ class DocumentStore:
 
     @property
     def hybrid(self) -> bool:
-        return self._index.vectors is not None and self._embedder is not None
+        if self._embedder is None:
+            return False
+        return self._vector_search is not None or self._index.vectors is not None
 
     @property
     def sources(self) -> list[str]:
@@ -79,6 +93,9 @@ class DocumentStore:
     def chunk_counts(self) -> dict[str, int]:
         return dict(sorted(Counter(c.metadata["source"] for c in self._index.chunks).items()))
 
+    def ocr_sources(self) -> set[str]:
+        return {c.metadata["source"] for c in self._index.chunks if c.metadata.get("ocr")}
+
     def export(self, source: str) -> tuple[list[Document], np.ndarray | None]:
         """Chunks and their vectors for one source, for persistence."""
         index = self._index
@@ -86,12 +103,13 @@ class DocumentStore:
         vectors = index.vectors[positions] if index.vectors is not None else None
         return [index.chunks[i] for i in positions], vectors
 
-    def add(self, chunks: list[Document], vectors: np.ndarray | None = None) -> None:
+    def add(self, chunks: list[Document], vectors: np.ndarray | None = None, embed: bool = True) -> None:
         """Index chunks, replacing any existing chunks from the same source files.
 
-        Pass `vectors` when restoring from storage to skip re-embedding.
+        Pass `vectors` when restoring from storage to skip re-embedding, or `embed=False`
+        when the vectors live in the database (pgvector) and needn't be held in memory.
         """
-        if vectors is None and self._embedder is not None and chunks:
+        if vectors is None and embed and self._embedder is not None and chunks:
             vectors = self._embed([c.page_content for c in chunks])
 
         incoming = {chunk.metadata["source"] for chunk in chunks}
@@ -168,6 +186,16 @@ class DocumentStore:
             query_vector = self._embedder.embed_query(query)
         except Exception as exc:
             logger.warning("Query embedding failed (%s); using keyword search only", exc)
+            return []
+        if self._vector_search is not None:
+            positions = {c.metadata.get("chunk_id"): i for i, c in enumerate(index.chunks)}
+            try:
+                hits = self._vector_search(query_vector, _DENSE_CANDIDATES)
+            except Exception as exc:
+                logger.warning("Vector search failed (%s); using keyword search only", exc)
+                return []
+            return [(positions[chunk_id], score) for chunk_id, score in hits if chunk_id in positions]
+        if index.vectors is None:
             return []
         similarities = index.vectors @ query_vector
         top = np.argsort(-similarities)[:_DENSE_CANDIDATES]

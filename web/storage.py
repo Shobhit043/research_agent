@@ -90,6 +90,8 @@ class Storage:
     """Backend-independent operations. Subclasses provide `_db()`, `_sql()` and `_executemany()`."""
 
     backend = "base"
+    # True when dense search runs in the database (pgvector) instead of in process memory.
+    vector_search_enabled = False
 
     def _sql(self, sql: str) -> str:
         raise NotImplementedError
@@ -116,6 +118,10 @@ class Storage:
 
     def close(self) -> None:
         pass
+
+    def vector_search(self, session_id: str, query: np.ndarray, k: int) -> list[tuple[str, float]]:
+        """(chunk_id, cosine similarity) of the k nearest chunks; only with pgvector."""
+        raise NotImplementedError
 
     # ----- sessions -----
 
@@ -182,6 +188,11 @@ class Storage:
     # ----- documents -----
 
     def replace_document(
+        self, session_id: str, source: str, chunks: list[Document], vectors: np.ndarray | None
+    ) -> None:
+        self._replace_chunks(session_id, source, chunks, vectors)
+
+    def _replace_chunks(
         self, session_id: str, source: str, chunks: list[Document], vectors: np.ndarray | None
     ) -> None:
         rows = [
@@ -262,10 +273,14 @@ class PostgresStorage(Storage):
 
     backend = "postgres"
 
-    def __init__(self, url: str, min_size: int = 1, max_size: int = 10):
+    def __init__(
+        self, url: str, embedding_dim: int = 384, use_pgvector: bool = True, min_size: int = 1, max_size: int = 10
+    ):
         from psycopg.rows import dict_row
         from psycopg_pool import ConnectionPool
 
+        self.embedding_dim = int(embedding_dim)
+        self._iterative_scan = False
         self._pool = ConnectionPool(
             url, min_size=min_size, max_size=max_size, open=True, timeout=10,
             kwargs={"row_factory": dict_row, "autocommit": False},
@@ -274,6 +289,108 @@ class PostgresStorage(Storage):
             # Serialise schema setup across instances starting at the same time.
             db.execute("SELECT pg_advisory_xact_lock(4242)")
             db.execute(_POSTGRES_SCHEMA)
+        if use_pgvector:
+            self.vector_search_enabled = self._setup_pgvector()
+
+    def _setup_pgvector(self) -> bool:
+        """Enable server-side vector search if the pgvector extension is available.
+
+        Any failure (extension not installed, no privilege, a column created for another
+        embedding size) leaves in-memory vector search in place rather than failing startup.
+        """
+        import psycopg
+
+        dim = self.embedding_dim
+        try:
+            with self._db() as db:
+                db.execute("SELECT pg_advisory_xact_lock(4242)")
+                db.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                row = db.execute(
+                    "SELECT atttypmod FROM pg_attribute WHERE attrelid = 'chunks'::regclass AND attname = 'vec'"
+                ).fetchone()
+                if row and row["atttypmod"] != dim:
+                    logger.warning(
+                        "pgvector disabled: chunks.vec holds %d-dim vectors but EMBEDDING_DIM is %d",
+                        row["atttypmod"], dim,
+                    )
+                    return False
+                db.execute(f"ALTER TABLE chunks ADD COLUMN IF NOT EXISTS vec vector({dim})")
+                # HNSW: approximate nearest neighbours, good recall without tuning or training.
+                db.execute("CREATE INDEX IF NOT EXISTS chunks_vec_hnsw ON chunks USING hnsw (vec vector_cosine_ops)")
+                version = db.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'").fetchone()
+        except psycopg.Error as exc:
+            logger.warning("pgvector unavailable (%s); vector search stays in memory", str(exc).strip())
+            return False
+        major, minor = (int(part) for part in version["extversion"].split(".")[:2])
+        self._iterative_scan = (major, minor) >= (0, 8)
+        backfilled = self._backfill_vectors()
+        logger.info("pgvector %s enabled (%d dimensions, HNSW index%s)", version["extversion"], dim,
+                    f", {backfilled} vectors migrated" if backfilled else "")
+        return True
+
+    def _backfill_vectors(self, batch: int = 500) -> int:
+        """Copy vectors stored as raw bytes (before pgvector was enabled) into the vector column."""
+        moved = 0
+        while True:
+            with self._db() as db:
+                rows = db.execute(
+                    "SELECT id, embedding FROM chunks WHERE vec IS NULL AND embedding IS NOT NULL"
+                    " AND length(embedding) = %s LIMIT %s",
+                    (self.embedding_dim * 4, batch),
+                ).fetchall()
+                if not rows:
+                    return moved
+                with db.cursor() as cursor:
+                    cursor.executemany(
+                        "UPDATE chunks SET vec = %s::vector, embedding = NULL WHERE id = %s",
+                        [(_vector_literal(np.frombuffer(bytes(r["embedding"]), dtype=np.float32)), r["id"])
+                         for r in rows],
+                    )
+            moved += len(rows)
+
+    def replace_document(
+        self, session_id: str, source: str, chunks: list[Document], vectors: np.ndarray | None
+    ) -> None:
+        if not self.vector_search_enabled or vectors is None:
+            self._replace_chunks(session_id, source, chunks, vectors)
+            return
+        if vectors.shape[1] != self.embedding_dim:
+            logger.warning("Vectors for %s have %d dims, expected %d; storing without pgvector",
+                           source, vectors.shape[1], self.embedding_dim)
+            self._replace_chunks(session_id, source, chunks, vectors)
+            return
+        rows = [
+            (session_id, source, json.dumps(chunk.metadata), chunk.page_content, _vector_literal(vectors[i]))
+            for i, chunk in enumerate(chunks)
+        ]
+        with self._db() as db:
+            db.execute("DELETE FROM chunks WHERE session_id = %s AND source = %s", (session_id, source))
+            with db.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO chunks (session_id, source, metadata, content, vec)"
+                    " VALUES (%s, %s, %s::jsonb, %s, %s::vector)",
+                    rows,
+                )
+
+    def load_chunks(self, session_id: str) -> tuple[list[Document], np.ndarray | None]:
+        chunks, vectors = super().load_chunks(session_id)
+        # With pgvector the vectors stay in the database; the store queries them there.
+        return (chunks, None) if self.vector_search_enabled else (chunks, vectors)
+
+    def vector_search(self, session_id: str, query: np.ndarray, k: int) -> list[tuple[str, float]]:
+        literal = _vector_literal(query)
+        with self._db() as db:
+            if self._iterative_scan:
+                # Without this, HNSW finds the global nearest rows first and the session filter
+                # can leave fewer than k; iterative scans keep searching until k rows match.
+                db.execute("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
+            rows = db.execute(
+                "SELECT metadata->>'chunk_id' AS chunk_id, 1 - (vec <=> %s::vector) AS similarity"
+                " FROM chunks WHERE session_id = %s AND vec IS NOT NULL"
+                " ORDER BY vec <=> %s::vector LIMIT %s",
+                (literal, session_id, literal, k),
+            ).fetchall()
+        return [(row["chunk_id"], float(row["similarity"])) for row in rows]
 
     def _sql(self, sql: str) -> str:
         return sql.replace("{json}", "%s::jsonb").replace("?", "%s")
@@ -291,12 +408,21 @@ class PostgresStorage(Storage):
         self._pool.close()
 
 
-def create_storage(database_url: str | None, sqlite_path: Path) -> Storage:
+def _vector_literal(vector: np.ndarray) -> str:
+    return "[" + ",".join(f"{float(x):.7g}" for x in vector) + "]"
+
+
+def create_storage(
+    database_url: str | None, sqlite_path: Path, embedding_dim: int = 384, use_pgvector: bool = True
+) -> Storage:
     if database_url and database_url.startswith(("postgres://", "postgresql://")):
-        storage = PostgresStorage(database_url.replace("postgres://", "postgresql://", 1))
+        storage = PostgresStorage(
+            database_url.replace("postgres://", "postgresql://", 1), embedding_dim, use_pgvector
+        )
     elif database_url:
         raise ValueError("DATABASE_URL must start with postgresql:// (leave it unset to use SQLite)")
     else:
         storage = SQLiteStorage(sqlite_path)
-    logger.info("Using %s storage", storage.backend)
+    logger.info("Using %s storage (vector search: %s)", storage.backend,
+                "pgvector" if storage.vector_search_enabled else "in memory")
     return storage

@@ -1,7 +1,8 @@
 "use strict";
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
-const SUPPORTED = [".pdf", ".txt", ".md"];
+const IMAGE_TYPES = [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"];
+const SUPPORTED = [".pdf", ".txt", ".md", ...IMAGE_TYPES];
 const CITATION = /\[([^\[\]\n]+?\.(?:pdf|txt|md))(?: p\.(\d+))?\]|\[([WAUP]?\d{1,2})\]/gi;
 const TOOL_LABELS = {
   search_documents: "Searching your documents",
@@ -541,7 +542,7 @@ function renderDocuments(documents, uploading = []) {
       icon("file"),
       h("div", { class: "doc-meta" },
         h("div", { class: "doc-name", title: doc.name, text: doc.name }),
-        h("div", { class: "doc-sub", text: `${doc.chunks} chunk${doc.chunks === 1 ? "" : "s"} indexed` })),
+        h("div", { class: "doc-sub", text: `${doc.chunks} chunk${doc.chunks === 1 ? "" : "s"} indexed${doc.ocr ? " · via OCR" : ""}` })),
       h("button", {
         class: "icon-btn", type: "button", "aria-label": `Remove ${doc.name}`, title: "Remove",
         onclick: () => removeDocument(doc.name),
@@ -562,8 +563,9 @@ function extensionOf(name) {
 // ---------- Attachments (ChatGPT-style chips in the composer) ----------
 
 function fileKind(name) {
-  const ext = extensionOf(name).slice(1);
-  return { label: ext.toUpperCase() || "FILE", kind: ext || "file" };
+  const ext = extensionOf(name);
+  if (IMAGE_TYPES.includes(ext)) return { label: "IMG", kind: "img" };
+  return { label: ext.slice(1).toUpperCase() || "FILE", kind: ext.slice(1) || "file" };
 }
 
 function formatSize(bytes) {
@@ -585,7 +587,7 @@ function fileChip(name, subtitle = "") {
 function attachFiles(files) {
   for (const file of files) {
     if (!SUPPORTED.includes(extensionOf(file.name))) {
-      showToast(`${file.name}: only PDF, TXT and MD files are supported.`, true);
+      showToast(`${file.name}: only PDF, TXT, MD and image files are supported.`, true);
       continue;
     }
     if (file.size > MAX_UPLOAD_BYTES) {
@@ -611,6 +613,7 @@ async function uploadAttachment(attachment) {
     attachment.status = "ready";
     const info = documents.find((d) => d.name === attachment.name);
     attachment.chunks = info ? info.chunks : 0;
+    attachment.ocr = Boolean(info?.ocr);
     renderDocuments(documents);
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -667,13 +670,13 @@ function renderAttachments() {
     let subtitle;
     if (a.status === "uploading") {
       const pct = Math.round(a.progress * 100);
-      subtitle = pct < 100 ? `Uploading ${pct}%` : "Indexing…";
+      subtitle = pct < 100 ? `Uploading ${pct}%` : "Reading and indexing…";
       const ring = h("div", { class: "file-ring" });
       ring.style.setProperty("--p", pct < 100 ? pct : 100);
       ring.classList.toggle("indeterminate", pct >= 100);
       tile.append(ring);
     } else if (a.status === "ready") {
-      subtitle = `${formatSize(a.file.size)} · ${a.chunks} chunk${a.chunks === 1 ? "" : "s"}`;
+      subtitle = `${formatSize(a.file.size)} · ${a.chunks} chunk${a.chunks === 1 ? "" : "s"}${a.ocr ? " · OCR" : ""}`;
     } else {
       subtitle = a.error || "Upload failed";
     }

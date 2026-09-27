@@ -32,7 +32,7 @@ class SessionManager:
 
     def __init__(
         self,
-        agent_factory: Callable[[str], ResearchAgent],
+        agent_factory: Callable[[str, Storage], ResearchAgent],
         storage: Storage,
         max_cached: int = 50,
     ):
@@ -44,7 +44,7 @@ class SessionManager:
     def create(self, owner: str) -> Session:
         session_id = uuid.uuid4().hex
         self._storage.create_session(session_id, owner)
-        session = Session(session_id, owner, self._factory(session_id))
+        session = Session(session_id, owner, self._factory(session_id, self._storage))
         self._remember(session)
         return session
 
@@ -65,11 +65,12 @@ class SessionManager:
         owner = self._storage.session_owner(session_id)
         if owner is None:
             raise HTTPException(404, NOT_FOUND)
-        agent = self._factory(session_id)
+        agent = self._factory(session_id, self._storage)
         agent.messages = self._storage.load_messages(session_id)
         chunks, vectors = self._storage.load_chunks(session_id)
         if chunks:
-            agent.store.add(chunks, vectors)
+            # With pgvector the vectors are queried in the database, so don't re-embed here.
+            agent.store.add(chunks, vectors, embed=not self._storage.vector_search_enabled)
         logger.info("Restored session %s (%d messages, %d chunks)", session_id, len(agent.messages), len(chunks))
         session = Session(session_id, owner, agent)
         self._remember(session)

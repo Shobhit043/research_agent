@@ -109,7 +109,10 @@ class ResearchAgent:
     # ----- documents and history -----
 
     def add_document(self, path: str | Path, name: str | None = None) -> int:
-        chunks = ingest_document(path, self.settings.chunk_size, self.settings.chunk_overlap, name=name)
+        chunks = ingest_document(
+            path, self.settings.chunk_size, self.settings.chunk_overlap, name=name,
+            ocr=self.settings.ocr_enabled, ocr_max_pages=self.settings.ocr_max_pages,
+        )
         self.store.add(chunks)
         logger.info("Indexed %s: %d chunks (hybrid=%s)", name or Path(path).name, len(chunks), self.store.hybrid)
         return len(chunks)

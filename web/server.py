@@ -28,7 +28,7 @@ from web.config import ServerSettings
 from web.observability import Metrics, request_id_var
 from web.security import SECURITY_HEADERS, RateLimiter, authenticate, client_ip
 from web.sessions import Session, SessionManager
-from web.storage import create_storage
+from web.storage import Storage, create_storage
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class ChatRequest(BaseModel):
 class DocumentInfo(BaseModel):
     name: str
     chunks: int
+    ocr: bool = False  # some or all of the text came from OCR
 
 
 class DocumentList(BaseModel):
@@ -59,13 +60,20 @@ class SessionInfo(BaseModel):
     token_budget: int
 
 
-def default_agent_factory() -> tuple[Callable[[str], ResearchAgent], FastEmbedEmbedder | None]:
+AgentFactory = Callable[[str, Storage], ResearchAgent]
+
+
+def default_agent_factory(settings: Settings) -> tuple[AgentFactory, FastEmbedEmbedder | None]:
     """One shared embedding model for all sessions; it's the only heavy object."""
-    settings = Settings.from_env()
     embedder = FastEmbedEmbedder(settings.embedding_model) if settings.use_embeddings else None
 
-    def factory(session_id: str) -> ResearchAgent:
-        return ResearchAgent(settings=settings, store=DocumentStore(embedder=embedder), session_id=session_id)
+    def factory(session_id: str, storage: Storage) -> ResearchAgent:
+        vector_search = None
+        if embedder is not None and storage.vector_search_enabled:
+            def vector_search(query, k):
+                return storage.vector_search(session_id, query, k)
+        store = DocumentStore(embedder=embedder, vector_search=vector_search)
+        return ResearchAgent(settings=settings, store=store, session_id=session_id)
 
     return factory, embedder
 
@@ -144,15 +152,19 @@ def _model_error(exc: groq.APIError) -> tuple[int, str]:
 
 
 def create_app(
-    agent_factory: Callable[[str], ResearchAgent] | None = None,
+    agent_factory: AgentFactory | None = None,
     settings: ServerSettings | None = None,
 ) -> FastAPI:
     settings = settings or ServerSettings.from_env()
+    agent_settings = Settings.from_env()
     embedder = None
     if agent_factory is None:
-        agent_factory, embedder = default_agent_factory()
+        agent_factory, embedder = default_agent_factory(agent_settings)
 
-    storage = create_storage(settings.database_url, settings.db_path)
+    storage = create_storage(
+        settings.database_url, settings.db_path,
+        embedding_dim=agent_settings.embedding_dim, use_pgvector=settings.use_pgvector,
+    )
     purged = storage.purge_idle(settings.session_ttl_days)
     if purged:
         logger.info("Purged %d sessions idle for over %d days", purged, settings.session_ttl_days)
@@ -187,7 +199,10 @@ def create_app(
         return authenticate(request, settings.api_keys)
 
     def documents_of(session: Session) -> list[DocumentInfo]:
-        return [DocumentInfo(name=n, chunks=c) for n, c in session.agent.store.chunk_counts().items()]
+        ocr = session.agent.store.ocr_sources()
+        return [
+            DocumentInfo(name=n, chunks=c, ocr=n in ocr) for n, c in session.agent.store.chunk_counts().items()
+        ]
 
     async def begin_turn(session_id: str, who: str) -> Session:
         session = sessions.get(session_id, who)
@@ -235,6 +250,7 @@ def create_app(
                 "database": storage.backend if database_ok else f"{storage.backend} unreachable",
                 "auth_required": bool(settings.api_keys),
                 "hybrid_search": embedder is not None,
+                "vector_search": "pgvector" if storage.vector_search_enabled else "memory",
             },
             status_code=200 if database_ok else 503,
         )

@@ -461,6 +461,7 @@ a.source:hover { border-color: var(--accent); }
 .file-tile.kind-pdf { background: #e5484d; }
 .file-tile.kind-md { background: #3e63dd; }
 .file-tile.kind-txt { background: #6b6a65; }
+.file-tile.kind-img { background: #8e4ec6; }
 .status-uploading .file-tile span { opacity: 0.35; }
 
 .file-ring {

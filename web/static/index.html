@@ -60,14 +60,14 @@
       <form class="composer" id="composer">
         <div class="attachments" id="attachments" hidden aria-label="Attached files"></div>
         <div class="composer-row">
-          <button class="attach-btn" id="attach" type="button" aria-label="Add files" title="Add files (PDF, TXT, MD, up to 20 MB)">
+          <button class="attach-btn" id="attach" type="button" aria-label="Add files" title="Add files: PDF, TXT, MD or images, up to 20 MB (scans are OCR'd)">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           </button>
           <textarea id="input" rows="1" placeholder="Ask anything, or attach files with +" aria-label="Message" maxlength="4000"></textarea>
           <button class="send" id="send" type="submit" aria-label="Send"></button>
         </div>
       </form>
-      <input type="file" id="file-input" accept=".pdf,.txt,.md" multiple hidden>
+      <input type="file" id="file-input" accept=".pdf,.txt,.md,.png,.jpg,.jpeg,.webp,.tif,.tiff" multiple hidden>
     </main>
   </div>
 
