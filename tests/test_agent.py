@@ -120,8 +120,9 @@ def test_tool_budget_exhaustion_forces_final_answer():
 
     assert agent.ask("q") == "best effort answer"
     # The forced answer must go to the unbound model; Groq 400s on tool_choice="none".
-    assert len(llm.bind_calls) == 1
-    assert "tool_choice" not in llm.bind_calls[0]
+    # Tools are bound once per research round (2); the forced answer uses no binding at all.
+    assert len(llm.bind_calls) == 2
+    assert all("tool_choice" not in call for call in llm.bind_calls)
 
 
 def test_failed_turn_is_rolled_back_so_history_stays_valid():
@@ -342,3 +343,35 @@ def test_budget_exhaustion_nudges_once_before_falling_back():
 
     assert agent.ask("q") == "Not in the documents."
     assert not any("Stop searching" in m.text for m in agent.messages), "the nudge must not be stored"
+
+
+# ----- LangGraph structure -----
+
+def test_graph_has_the_expected_nodes_and_edges():
+    agent, _ = make_agent([])
+    graph = agent.graph.get_graph()
+
+    assert set(graph.nodes) == {"__start__", "analyze", "direct", "research", "tools", "finalize", "__end__"}
+    edges = {(e.source, e.target) for e in graph.edges}
+    assert {("__start__", "analyze"), ("analyze", "direct"), ("analyze", "research"), ("direct", "research"),
+            ("research", "tools"), ("tools", "research"), ("research", "finalize"), ("finalize", "__end__")} <= edges
+
+
+def test_graph_renders_as_mermaid():
+    agent, _ = make_agent([])
+
+    assert "research" in agent.graph.get_graph().draw_mermaid()
+
+
+def test_history_is_only_committed_when_the_graph_finishes():
+    agent, _ = make_agent([tool_call("search_documents", {"query": "groq"}, "c1"), "answer"])
+    snapshots = []
+
+    async def watch():
+        async for event in agent.astream("q"):
+            snapshots.append((event.type, len(agent.messages)))
+
+    asyncio.run(watch())
+
+    assert all(count == 0 for kind, count in snapshots if kind != "done"), "no partial history mid-turn"
+    assert snapshots[-1] == ("done", 4)  # human, tool request, tool result, answer

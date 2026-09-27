@@ -1,12 +1,27 @@
+"""The research agent, orchestrated as a LangGraph state machine.
+
+    START → analyze ─┬─ direct ──────────────────────────┬─→ END
+                     │     └─ (model wanted a tool) ─┐   │
+                     └─────────────────────────────→ research ⇄ tools
+                                                     └─ (budget spent) → finalize → END
+
+Each node is one step: routing, a model call, or a batch of tool calls. Nodes stream progress
+through LangGraph's custom stream writer, and `ResearchAgent.astream` turns those into
+`AgentEvent`s. The graph works on a copy of the conversation; history is committed only when
+a turn completes, so a failed, cancelled or abandoned turn leaves no trace.
+"""
+
 import asyncio
 import datetime
 import json
 import logging
+import operator
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated, Literal, TypedDict
 
 import groq
 from langchain_core.language_models import BaseChatModel
@@ -22,17 +37,16 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool
 from langchain_groq import ChatGroq
+from langgraph.config import get_stream_writer
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.runtime import Runtime
 
 from agent.citations import collect_sources, evidence_pages, verify_citations
 from agent.config import Settings
 from agent.documents import DocumentStore, ingest_document
 from agent.guardrails import scan_for_injection, wrap_untrusted
-from agent.prompts import (
-    AGENT_SYSTEM_PROMPT,
-    BUDGET_EXHAUSTED,
-    NO_TOOLS,
-    QUERY_ANALYSIS_PROMPT,
-)
+from agent.prompts import AGENT_SYSTEM_PROMPT, BUDGET_EXHAUSTED, NO_TOOLS, QUERY_ANALYSIS_PROMPT
 from agent.schemas import AgentEvent, QueryAnalysis, ToolCallRecord, TurnResult, Usage
 from agent.tools import DOCUMENT_TOOLS, build_tools, tool_guidance
 
@@ -49,6 +63,9 @@ _BUDGET_FALLBACK = (
     "or ask me to summarise what I found so far."
 )
 
+Route = Literal["direct", "research", "tools", "finalize", "end"]
+Writer = Callable[[dict], None]
+
 
 def _is_tool_use_failed(exc: groq.APIError) -> bool:
     # Before streaming starts Groq returns a 400 with code tool_use_failed; once a stream is
@@ -62,7 +79,9 @@ def _elapsed_ms(started: float) -> int:
 
 
 @dataclass
-class _TurnState:
+class TurnContext:
+    """Per-turn bookkeeping shared by the nodes (LangGraph runtime context, not graph state)."""
+
     trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
     started: float = field(default_factory=time.perf_counter)
     usage: Usage = field(default_factory=Usage)
@@ -71,11 +90,21 @@ class _TurnState:
     warnings: list[str] = field(default_factory=list)
 
 
+class TurnState(TypedDict, total=False):
+    messages: Annotated[list[BaseMessage], add_messages]  # prior history + this turn
+    question: str
+    analysis: QueryAnalysis
+    variables: dict  # prompt variables: documents, analysis, today
+    rounds: int  # research rounds used, including rejected ones
+    seen: Annotated[list[str], operator.add]  # tool calls already run this turn (for dedup)
+    next: Route  # set by each node; read by the conditional edges
+
+
 class ResearchAgent:
     """Tool-calling research assistant: analyse the query, gather evidence, answer with citations.
 
     `astream` is the core: an async generator of progress events ending in `done`.
-    `arun`, `run` and `ask` are conveniences on top of it.
+    `arun`, `run` and `ask` are conveniences on top of it. `graph` is the compiled LangGraph.
     """
 
     def __init__(
@@ -105,6 +134,7 @@ class ResearchAgent:
         # json_schema (native structured output) rather than the default forced tool call:
         # gpt-oss often answers short inputs like "thanks" in prose, which Groq rejects.
         ) | self.llm.with_structured_output(QueryAnalysis, method="json_schema", include_raw=True)
+        self.graph = self._build_graph()
 
     # ----- documents and history -----
 
@@ -138,163 +168,215 @@ class ResearchAgent:
         raise RuntimeError("agent stream ended without a result")
 
     async def astream(self, question: str) -> AsyncIterator[AgentEvent]:
-        turn = _TurnState()
-        checkpoint = len(self.messages)
-        try:
-            self.messages.append(HumanMessage(question))
-            analysis = await self._analyze(question, turn)
-            logger.info("Query analysis [%s]:\n%s", turn.trace_id, analysis.render())
-            yield AgentEvent(type="analysis", data=analysis.model_dump())
-
-            variables = {
-                "documents": self._documents_label(),
-                "analysis": analysis.render(),
-                "today": datetime.date.today().isoformat(),
-            }
-            if analysis.needs_retrieval:
-                async for event in self._research(variables, turn):
-                    yield event
+        context = TurnContext()
+        history_length = len(self.messages)
+        initial: TurnState = {
+            "messages": [*self.messages, HumanMessage(question)],
+            "question": question,
+            "rounds": 0,
+            "seen": [],
+        }
+        config = {
+            # Every research round is two graph steps (model, tools); leave room for retries.
+            "recursion_limit": 4 * self.settings.max_tool_iterations + 10,
+            **self._run_config(context, "research_turn"),
+        }
+        final: TurnState | None = None
+        async for mode, payload in self.graph.astream(
+            initial, config=config, context=context, stream_mode=["custom", "values"]
+        ):
+            if mode == "custom":
+                yield AgentEvent(**payload)
             else:
-                try:
-                    async for event in self._reply({**variables, "tool_guidance": NO_TOOLS}, turn):
-                        yield event
-                except groq.APIError as exc:
-                    if not _is_tool_use_failed(exc):
-                        raise
-                    # The model tried to call a tool, so the router was wrong: research instead.
-                    logger.info("Model requested a tool on the direct path; switching to research")
-                    yield AgentEvent(type="reset")
-                    async for event in self._research(variables, turn):
-                        yield event
-        except BaseException:
-            # Failed, cancelled, or abandoned mid-stream (the client disconnected): drop the
-            # partial turn so history never holds a tool call without its result.
-            del self.messages[checkpoint:]
-            raise
-        yield AgentEvent(type="done", result=self._finish_turn(checkpoint, analysis, turn))
+                final = payload
 
-    # ----- turn steps -----
+        # Commit only now: if the graph raised or the consumer stopped iterating (the browser
+        # disconnected), we never get here and history is untouched.
+        self.messages = list(final["messages"])
+        yield AgentEvent(type="done", result=self._finish_turn(history_length, final["analysis"], context))
 
-    async def _analyze(self, question: str, turn: _TurnState) -> QueryAnalysis:
+    # ----- graph -----
+
+    def _build_graph(self):
+        graph = StateGraph(TurnState, context_schema=TurnContext)
+        graph.add_node("analyze", self._analyze_node)
+        graph.add_node("direct", self._direct_node)
+        graph.add_node("research", self._research_node)
+        graph.add_node("tools", self._tools_node)
+        graph.add_node("finalize", self._finalize_node)
+
+        def route(state: TurnState) -> str:
+            return state["next"]
+
+        graph.add_edge(START, "analyze")
+        graph.add_conditional_edges("analyze", route, {"direct": "direct", "research": "research"})
+        graph.add_conditional_edges("direct", route, {"end": END, "research": "research"})
+        graph.add_conditional_edges(
+            "research", route, {"tools": "tools", "research": "research", "finalize": "finalize", "end": END}
+        )
+        graph.add_edge("tools", "research")
+        graph.add_edge("finalize", END)
+        return graph.compile(name="research_agent")
+
+    async def _analyze_node(self, state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
+        """Route the question: research with tools, or answer directly."""
+        context = runtime.context
+        analysis = await self._analyze(state["question"], state["messages"][:-1], context)
+        logger.info("Query analysis [%s]:\n%s", context.trace_id, analysis.render())
+        get_stream_writer()({"type": "analysis", "data": analysis.model_dump()})
+        variables = {
+            "documents": self._documents_label(),
+            "analysis": analysis.render(),
+            "today": datetime.date.today().isoformat(),
+        }
+        return {
+            "analysis": analysis,
+            "variables": variables,
+            "next": "research" if analysis.needs_retrieval else "direct",
+        }
+
+    async def _direct_node(self, state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
+        """Answer without tools (small talk, general knowledge)."""
+        writer = get_stream_writer()
+        try:
+            message = await self._call_model(
+                self._prompt | self.llm, {**state["variables"], "tool_guidance": NO_TOOLS},
+                state["messages"], runtime.context, writer,
+            )
+        except groq.APIError as exc:
+            if not _is_tool_use_failed(exc):
+                raise
+            # The model tried to call a tool, so the router was wrong: research instead.
+            logger.info("Model requested a tool on the direct path; switching to research")
+            writer({"type": "reset"})
+            return {"next": "research"}
+        return {"messages": [message], "next": "end"}
+
+    async def _research_node(self, state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
+        """One model call with tools bound: it either requests tools or answers."""
+        rounds = state.get("rounds", 0)
+        if rounds >= self.settings.max_tool_iterations:
+            logger.warning("Tool budget of %d rounds exhausted; forcing a final answer", rounds)
+            return {"next": "finalize"}
+
+        tools = self._bound_tools()
+        writer = get_stream_writer()
+        try:
+            message = await self._call_model(
+                self._prompt | self.llm.bind_tools(tools),
+                {**state["variables"], "tool_guidance": tool_guidance(tools)},
+                state["messages"], runtime.context, writer,
+            )
+        except groq.APIError as exc:
+            if not _is_tool_use_failed(exc):
+                raise
+            # e.g. gpt-oss calling its built-in browser tool; retry the round (it counts
+            # against the budget, so this can't loop forever).
+            logger.warning("Malformed tool call rejected by Groq; retrying the round: %s", exc)
+            writer({"type": "reset"})
+            return {"rounds": rounds + 1, "next": "research"}
+        return {"messages": [message], "rounds": rounds + 1, "next": "tools" if message.tool_calls else "end"}
+
+    async def _tools_node(self, state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
+        """Run every tool call from the last model message, concurrently."""
+        context = runtime.context
+        writer = get_stream_writer()
+        calls = state["messages"][-1].tool_calls
+        tools_by_name = {t.name: t for t in self._bound_tools()}
+        seen = set(state.get("seen", []))
+        before = set(seen)
+
+        for call in calls:
+            writer({"type": "tool_start", "data": {"id": call["id"], "name": call["name"], "args": call["args"]}})
+        # gather keeps results in call order; every call gets exactly one ToolMessage reply.
+        results = await asyncio.gather(
+            *(self._run_tool_call(call, tools_by_name, seen, context) for call in calls)
+        )
+        for call in calls:
+            writer({"type": "tool_end", "data": {
+                "id": call["id"],
+                "name": call["name"],
+                "duration_ms": context.durations.get(call["id"], 0),
+                "flagged": call["id"] in context.flagged,
+            }})
+        return {"messages": list(results), "seen": sorted(seen - before)}
+
+    async def _finalize_node(self, state: TurnState, runtime: Runtime[TurnContext]) -> TurnState:
+        """The tool budget is spent: answer from what was gathered, without tools."""
+        writer = get_stream_writer()
+        variables = {**state["variables"], "tool_guidance": BUDGET_EXHAUSTED}
+        # gpt-oss sometimes still reaches for a tool here. A user-turn nudge is a stronger signal
+        # than the system prompt; it goes to this one call only and is never stored in history.
+        for nudge in (None, HumanMessage(_FINAL_ANSWER_NUDGE)):
+            try:
+                message = await self._call_model(
+                    self._prompt | self.llm, variables, state["messages"], runtime.context, writer, nudge
+                )
+                return {"messages": [message]}
+            except groq.APIError as exc:
+                if not _is_tool_use_failed(exc):
+                    raise
+                writer({"type": "reset"})
+        return {"messages": [AIMessage(_BUDGET_FALLBACK)]}
+
+    # ----- steps used by the nodes -----
+
+    def _bound_tools(self) -> list[BaseTool]:
+        has_documents = bool(self.store.sources)
+        return [t for name, t in self._tools.items() if has_documents or name not in DOCUMENT_TOOLS]
+
+    async def _analyze(self, question: str, previous: list[BaseMessage], context: TurnContext) -> QueryAnalysis:
         fallback = QueryAnalysis(needs_retrieval=True, sub_questions=[question])
         try:
             output = await self._analyzer.ainvoke(
                 {
                     "question": question,
                     "documents": self._documents_label(),
-                    "recent": self._recent_conversation(),
+                    "recent": self._recent_conversation(previous),
                 },
-                config=self._run_config(turn, "query_analysis"),
+                config=self._run_config(context, "query_analysis"),
             )
         except Exception as exc:
             # Routing is an optimisation; if it fails, researching is the safe default.
             logger.warning("Query analysis failed (%s); defaulting to retrieval", exc)
             return fallback
         raw = output.get("raw")
-        turn.usage.add(getattr(raw, "usage_metadata", None))
+        context.usage.add(getattr(raw, "usage_metadata", None))
         return output.get("parsed") or fallback
 
-    async def _research(self, variables: dict, turn: _TurnState) -> AsyncIterator[AgentEvent]:
-        has_documents = bool(self.store.sources)
-        tools = [t for name, t in self._tools.items() if has_documents or name not in DOCUMENT_TOOLS]
-        guidance = tool_guidance(tools)
-        tools_by_name = {t.name: t for t in tools}
-        chain = self._prompt | self.llm.bind_tools(tools)
-        seen: set[tuple[str, str]] = set()
-
-        for _ in range(self.settings.max_tool_iterations):
-            response = None
-            try:
-                async for item in self._call_model(chain, {**variables, "tool_guidance": guidance}, turn):
-                    if isinstance(item, AIMessage):
-                        response = item
-                    else:
-                        yield item
-            except groq.APIError as exc:
-                if not _is_tool_use_failed(exc):
-                    raise
-                # e.g. gpt-oss calling its built-in browser tool; retry the round (it counts
-                # against the budget, so this can't loop forever).
-                logger.warning("Malformed tool call rejected by Groq; retrying the round: %s", exc)
-                yield AgentEvent(type="reset")
-                continue
-            self.messages.append(response)
-            if not response.tool_calls:
-                return
-
-            for call in response.tool_calls:
-                yield AgentEvent(type="tool_start", data={"id": call["id"], "name": call["name"], "args": call["args"]})
-            # Independent tool calls run concurrently; gather keeps results in call order.
-            results = await asyncio.gather(
-                *(self._run_tool_call(call, tools_by_name, seen, turn) for call in response.tool_calls)
-            )
-            for call, message in zip(response.tool_calls, results, strict=True):
-                self.messages.append(message)
-                yield AgentEvent(type="tool_end", data={
-                    "id": call["id"],
-                    "name": call["name"],
-                    "duration_ms": turn.durations.get(call["id"], 0),
-                    "flagged": call["id"] in turn.flagged,
-                })
-
-        logger.warning("Tool budget of %d rounds exhausted; forcing a final answer",
-                       self.settings.max_tool_iterations)
-        final_variables = {**variables, "tool_guidance": BUDGET_EXHAUSTED}
-        # gpt-oss sometimes still reaches for a tool here. A user-turn nudge is a stronger signal
-        # than the system prompt; it goes to this one call only and is never stored in history.
-        for nudge in (None, HumanMessage(_FINAL_ANSWER_NUDGE)):
-            try:
-                async for event in self._reply(final_variables, turn, nudge):
-                    yield event
-                return
-            except groq.APIError as exc:
-                if not _is_tool_use_failed(exc):
-                    raise
-                yield AgentEvent(type="reset")
-        self.messages.append(AIMessage(_BUDGET_FALLBACK))
-
-    async def _reply(
-        self, variables: dict, turn: _TurnState, nudge: BaseMessage | None = None
-    ) -> AsyncIterator[AgentEvent]:
-        # No tools bound, and not tool_choice="none": Groq answers that with a 400
-        # (tool_use_failed) whenever the model still emits a tool call.
-        response = None
-        async for item in self._call_model(self._prompt | self.llm, variables, turn, nudge):
-            if isinstance(item, AIMessage):
-                response = item
-            else:
-                yield item
-        self.messages.append(response)
-
     async def _call_model(
-        self, chain, variables: dict, turn: _TurnState, nudge: BaseMessage | None = None
-    ) -> AsyncIterator[AgentEvent | AIMessage]:
-        """Stream one model call: yields token events, then the complete AIMessage last."""
+        self, chain, variables: dict, messages: list[BaseMessage], context: TurnContext, writer: Writer,
+        nudge: BaseMessage | None = None,
+    ) -> AIMessage:
+        """Stream one model call, emitting token events, and return the complete message.
+
+        No tools bound means the model *can't* call one; `tool_choice="none"` would instead get
+        a 400 (tool_use_failed) from Groq whenever gpt-oss emits a tool call anyway.
+        """
         aggregate = None
         streamed = False
-        history = self._history() + ([nudge] if nudge else [])
+        history = self._history(messages) + ([nudge] if nudge else [])
         async for chunk in chain.astream(
-            {**variables, "history": history},
-            config=self._run_config(turn, "agent_step"),
+            {**variables, "history": history}, config=self._run_config(context, "agent_step")
         ):
             aggregate = chunk if aggregate is None else aggregate + chunk
             if chunk.text:
                 streamed = True
-                yield AgentEvent(type="token", data={"text": chunk.text})
+                writer({"type": "token", "data": {"text": chunk.text}})
 
         message = message_chunk_to_message(aggregate) if aggregate is not None else AIMessage("")
-        turn.usage.add(message.usage_metadata)
+        context.usage.add(message.usage_metadata)
         if message.tool_calls and streamed:
             # Text streamed before the model decided to call tools isn't the answer.
-            yield AgentEvent(type="reset")
-        yield message
+            writer({"type": "reset"})
+        return message
 
     async def _run_tool_call(
-        self, call: dict, tools: dict[str, BaseTool], seen: set[tuple[str, str]], turn: _TurnState
+        self, call: dict, tools: dict[str, BaseTool], seen: set[str], context: TurnContext
     ) -> ToolMessage:
         # Every tool call must get a ToolMessage reply, or the next API request is rejected.
         name, args = call["name"], call["args"]
-        key = (name, json.dumps(args, sort_keys=True, default=str))
+        key = json.dumps([name, args], sort_keys=True, default=str)
         started = time.perf_counter()
 
         if name not in tools:
@@ -303,10 +385,10 @@ class ResearchAgent:
             raw = "Skipped: this exact call already ran this turn. Use its earlier result."
         else:
             seen.add(key)
-            logger.info("Tool call [%s]: %s(%s)", turn.trace_id, name, args)
+            logger.info("Tool call [%s]: %s(%s)", context.trace_id, name, args)
             try:
                 result = await asyncio.wait_for(
-                    tools[name].ainvoke(args, config=self._run_config(turn, name)),
+                    tools[name].ainvoke(args, config=self._run_config(context, name)),
                     timeout=self.settings.tool_timeout,
                 )
                 raw = str(result)
@@ -317,11 +399,11 @@ class ResearchAgent:
                 logger.warning("Tool %s failed: %s", name, exc)
                 raw = f"Error: {name} failed: {exc}"
 
-        turn.durations[call["id"]] = _elapsed_ms(started)
+        context.durations[call["id"]] = _elapsed_ms(started)
         injection = scan_for_injection(raw)
         if injection:
-            turn.flagged.add(call["id"])
-            turn.warnings.append(
+            context.flagged.add(call["id"])
+            context.warnings.append(
                 f"Possible prompt injection in {name} result ({injection[0]!r}); treated as data."
             )
             logger.warning("Possible prompt injection in %s result: %s", name, injection)
@@ -332,7 +414,7 @@ class ResearchAgent:
             tool_call_id=call["id"],
         )
 
-    def _finish_turn(self, turn_start: int, analysis: QueryAnalysis, turn: _TurnState) -> TurnResult:
+    def _finish_turn(self, turn_start: int, analysis: QueryAnalysis, context: TurnContext) -> TurnResult:
         messages = self.messages[turn_start:]
         results = {
             m.tool_call_id: (m.artifact if isinstance(m.artifact, str) else m.text)
@@ -353,8 +435,8 @@ class ResearchAgent:
                 name=call["name"],
                 args=call["args"],
                 output=results.get(call["id"], "")[:_TRACE_CHARS],
-                duration_ms=turn.durations.get(call["id"], 0),
-                flagged=call["id"] in turn.flagged,
+                duration_ms=context.durations.get(call["id"], 0),
+                flagged=call["id"] in context.flagged,
             )
             for message in messages
             if isinstance(message, AIMessage)
@@ -366,25 +448,26 @@ class ResearchAgent:
             tool_calls=calls,
             sources=collect_sources(outputs),
             removed_citations=removed,
-            warnings=turn.warnings,
-            usage=turn.usage,
-            latency_ms=_elapsed_ms(turn.started),
-            trace_id=turn.trace_id,
+            warnings=context.warnings,
+            usage=context.usage,
+            latency_ms=_elapsed_ms(context.started),
+            trace_id=context.trace_id,
         )
 
     # ----- helpers -----
 
-    def _run_config(self, turn: _TurnState, run_name: str) -> dict:
+    def _run_config(self, context: TurnContext, run_name: str) -> dict:
         # Shows up in LangSmith when tracing is enabled; harmless otherwise.
         return {
             "run_name": run_name,
-            "metadata": {"trace_id": turn.trace_id, "session_id": self.session_id},
+            "metadata": {"trace_id": context.trace_id, "session_id": self.session_id},
             "tags": ["research-assistant"],
         }
 
-    def _history(self) -> list[BaseMessage]:
+    def _history(self, messages: list[BaseMessage] | None = None) -> list[BaseMessage]:
+        messages = self.messages if messages is None else messages
         trimmed = trim_messages(
-            self.messages,
+            messages,
             max_tokens=self.settings.history_token_budget,
             token_counter=count_tokens_approximately,
             strategy="last",
@@ -395,7 +478,7 @@ class ResearchAgent:
             return trimmed
 
         # The current turn alone is over budget: shrink its oldest tool results until it fits.
-        turn = list(self.messages[self._last_human_index():])
+        turn = list(messages[_last_human_index(messages):])
         for index, message in enumerate(turn):
             if count_tokens_approximately(turn) <= self.settings.history_token_budget:
                 break
@@ -405,23 +488,22 @@ class ResearchAgent:
                 })
         return turn
 
-    def _last_human_index(self) -> int:
-        for index in range(len(self.messages) - 1, -1, -1):
-            if isinstance(self.messages[index], HumanMessage):
-                return index
-        return 0
-
-    def _recent_conversation(self, turns: int = 4, max_chars: int = 400) -> str:
-        previous = [
-            m for m in self.messages[:-1]
-            if isinstance(m, (HumanMessage, AIMessage)) and m.text
-        ][-turns:]
-        if not previous:
+    @staticmethod
+    def _recent_conversation(previous: list[BaseMessage], turns: int = 4, max_chars: int = 400) -> str:
+        recent = [m for m in previous if isinstance(m, (HumanMessage, AIMessage)) and m.text][-turns:]
+        if not recent:
             return "(none)"
         return "\n".join(
             f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.text[:max_chars]}"
-            for m in previous
+            for m in recent
         )
 
     def _documents_label(self) -> str:
         return ", ".join(self.store.sources) or "none"
+
+
+def _last_human_index(messages: list[BaseMessage]) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            return index
+    return 0
