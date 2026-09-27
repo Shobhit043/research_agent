@@ -19,7 +19,7 @@ except `GET /api/health`. Sessions are private to the key that created them; ano
 | `POST /api/sessions` | Create a session | `201` |
 | `GET /api/sessions/{id}` | Documents, past turns and token usage | `200` |
 | `GET /api/sessions/{id}/documents` | List indexed documents | `200` |
-| `POST /api/sessions/{id}/documents` | Upload a file (multipart field `file`) | `201` |
+| `POST /api/sessions/{id}/documents` | Upload a file (multipart field `file`): PDF, TXT, MD, PNG, JPG, WebP or TIFF | `201` |
 | `DELETE /api/sessions/{id}/documents/{name}` | Remove a document | `200` |
 | `POST /api/sessions/{id}/chat/stream` | Ask a question; Server-Sent Events | `200` stream |
 | `POST /api/sessions/{id}/chat` | Ask a question; one JSON response | `200` |
@@ -106,8 +106,8 @@ Returned by `POST /chat` and in the `done` event:
 |---|---|
 | `POST /sessions` | `{"session_id": str, "token_budget": int}` |
 | `GET /sessions/{id}` | `{"session_id", "documents": [{"name", "chunks"}], "turns": [{"question", "attachments", "result": TurnResult}], "tokens_used", "token_budget"}` |
-| Upload, list, delete documents | `{"documents": [{"name": str, "chunks": int}]}` |
-| `GET /health` | `{"status": "ok" \| "degraded", "database": "postgres" \| "sqlite", "auth_required": bool, "hybrid_search": bool}` |
+| Upload, list, delete documents | `{"documents": [{"name": str, "chunks": int, "ocr": bool}]}`; `ocr` is true when some text came from OCR |
+| `GET /health` | `{"status": "ok" \| "degraded", "database": "postgres" \| "sqlite", "auth_required": bool, "hybrid_search": bool, "vector_search": "pgvector" \| "memory"}` |
 
 ## Errors
 
@@ -120,8 +120,8 @@ Errors are JSON `{"detail": "…"}` with these status codes:
 | `404` | Unknown session, a session owned by another key, or an unknown document |
 | `409` | The session is still answering the previous message |
 | `413` | Upload is over `MAX_UPLOAD_MB` |
-| `415` | Unsupported file type (only `.pdf`, `.txt`, `.md`) |
-| `422` | Invalid body, or a file with no extractable text (corrupt, empty, scanned, not UTF-8) |
+| `415` | Unsupported file type (supported: `.pdf`, `.txt`, `.md`, `.png`, `.jpg`, `.jpeg`, `.webp`, `.tif`, `.tiff`) |
+| `422` | Invalid body, or a file with no readable text (corrupt, empty, not UTF-8, or a scan where OCR found nothing) |
 | `429` | Rate limit (with a `Retry-After` header), session token budget used up, or Groq rate limit |
 | `502` | The model API failed |
 | `503` | Health check only: the database is unreachable |

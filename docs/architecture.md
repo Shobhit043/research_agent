@@ -9,7 +9,7 @@ design decisions behind each part.
 Browser ──SSE──► FastAPI ──► SessionManager (LRU cache) ◄──► PostgreSQL / SQLite
    │               │                │                          sessions, turns,
    │  auth · rate limits · CSP      ▼                          chunks + vectors
-   │  request ids · metrics   ResearchAgent.astream()  ── async generator of events
+   │  request ids · metrics   ResearchAgent.astream()  ── runs a LangGraph StateGraph
    │                                │
    │                ┌───────────────┴──────────────────┐
    │                ▼                                  ▼
@@ -23,6 +23,52 @@ Browser ──SSE──► FastAPI ──► SessionManager (LRU cache) ◄─�
 
 The agent package (`agent/`) has no web dependencies; the server (`web/`) wraps it. The same
 agent runs in the web app, the evaluation harness and the tests.
+
+## The agent graph
+
+Each turn runs a [LangGraph](https://langchain-ai.github.io/langgraph/) `StateGraph`, defined in
+[`research_agent.py`](../agent/research_agent.py). LangChain still provides the building blocks
+(the Groq chat model, prompts, tools and message types); LangGraph orchestrates them.
+
+```mermaid
+graph TD;
+    START([start]) --> analyze;
+    analyze -.->|small talk| direct;
+    analyze -.->|needs research| research;
+    direct -.->|answered| END([end]);
+    direct -.->|model wanted a tool| research;
+    research -.->|tool calls| tools;
+    tools --> research;
+    research -.->|malformed tool call, retry| research;
+    research -.->|answered| END;
+    research -.->|budget spent| finalize;
+    finalize --> END;
+```
+
+| Node | Does | Next |
+|---|---|---|
+| `analyze` | Structured routing: `needs_retrieval`, sub-questions | `direct` or `research` |
+| `direct` | Answers with no tools bound | end; or `research` if Groq reports the model tried to call a tool |
+| `research` | One model call with tools bound; counts rounds | `tools`, end, a retry of itself after a rejected tool call, or `finalize` when `max_tool_iterations` is spent |
+| `tools` | Runs every requested call concurrently; one `ToolMessage` each | `research` |
+| `finalize` | Final answer with no tools, then a nudge, then a fallback | end |
+
+**State** (`TurnState`) holds the conversation (with LangGraph's `add_messages` reducer), the
+routing analysis, prompt variables, the round counter, the dedup keys of tool calls already made
+(an append reducer), and `next`, which each node sets and the conditional edges read.
+**Runtime context** (`TurnContext`, passed via `context_schema`) carries per-turn bookkeeping that
+isn't conversation state: trace ID, token usage, tool timings, injection flags and warnings.
+
+**Streaming.** Nodes emit progress with LangGraph's `get_stream_writer()`. `astream()` runs the
+graph with `stream_mode=["custom", "values"]`, forwarding custom events to callers and keeping the
+last state snapshot.
+
+**Commit on completion.** The graph starts from a copy of the conversation plus the new question.
+`agent.messages` is replaced with the graph's final messages only after the graph finishes. If a
+node raises, or the caller stops iterating (the browser disconnects or the user presses stop),
+nothing is committed, so history can never hold half a tool exchange.
+
+The graph is exposed as `agent.graph`; `agent.graph.get_graph().draw_mermaid()` renders it.
 
 ## A turn, step by step
 
@@ -64,16 +110,15 @@ that are bound (see [gpt-oss quirks](#working-around-gpt-oss-on-groq)).
 
 ### 3. Streaming
 
-`ResearchAgent.astream()` is an async generator yielding events:
+`ResearchAgent.astream()` yields events as the graph runs:
 
 ```
 analysis → tool_start → tool_end → … → token → token → … → done
 ```
 
 The SSE endpoint forwards them, the JSON endpoint collects them, and the evaluation harness
-consumes them. If the consumer stops iterating (for example, the browser disconnects or the user
-presses stop), the generator's cleanup path rolls back the partial turn, so history never contains
-half a tool exchange.
+consumes them. `done` is emitted after the graph finishes and history is committed (see
+[commit on completion](#the-agent-graph)).
 
 ### 4. Citation check
 
@@ -115,10 +160,16 @@ All HTTP tools share [`tools/http.py`](../agent/tools/http.py):
 
 **Ingestion.**
 - PDFs are read page by page with pypdf; TXT and MD files are read as UTF-8.
+- **OCR.** A PDF page with under 20 characters of extractable text is treated as a scan: it's
+  rendered at 200 DPI with pypdfium2 and read by RapidOCR (PaddleOCR models on the ONNX runtime the
+  embeddings already use, so there's no system Tesseract to install). Images (PNG, JPG, WebP, TIFF)
+  go straight to OCR. Lines under 0.5 confidence are dropped, OCR'd chunks carry
+  `metadata["ocr"] = True` (the UI labels them), and at most `OCR_MAX_PAGES` pages per document
+  are OCR'd. The models load on first use and are shared behind a lock.
 - Text is cleaned (joined hyphenation, collapsed whitespace), then split into 1,000-character
   chunks with 150-character overlap.
 - **Chunks never cross page boundaries**, so every chunk cites exactly one page.
-- Blank, corrupt, encrypted and scanned files produce clear errors.
+- Blank, corrupt and encrypted files, and scans in which OCR finds nothing, produce clear errors.
 
 **Hybrid search.** Each query is ranked two ways, then fused:
 
@@ -131,6 +182,22 @@ The two rankings are combined with **reciprocal rank fusion** (k = 60), which ne
 normalisation. Indexes are immutable snapshots swapped in one assignment, so a search never sees
 a half-built index. If the embedding model can't load, search degrades to BM25 alone.
 
+**Where the vectors live.**
+
+| | In memory (SQLite, or Postgres without pgvector) | pgvector (Postgres with the extension) |
+|---|---|---|
+| Dense search | NumPy dot product over the session's vectors | `ORDER BY vec <=> query LIMIT 20` on an HNSW cosine index, filtered by session |
+| Vectors in RAM | Yes, for every active session | No; restored sessions load only chunk text |
+| Stored as | Raw float32 bytes | `vector(EMBEDDING_DIM)` column |
+| Shared across instances | Rebuilt per instance | One index for all instances |
+
+pgvector is detected at startup: the extension is created, the column and HNSW index are added,
+and any vectors stored as raw bytes before it was enabled are migrated into the column. Results
+map back to in-memory chunks by `chunk_id`. With pgvector ≥ 0.8, queries set
+`hnsw.iterative_scan = relaxed_order`, so the per-session filter can't leave fewer results than
+requested. If the extension is missing, lacks privileges, or the column was created for a different
+embedding size, the server logs a warning and uses in-memory search instead of failing.
+
 ## Persistence and sessions
 
 [`storage.py`](../web/storage.py) implements one query layer over two backends:
@@ -138,16 +205,19 @@ a half-built index. If the embedding model can't load, search degrades to BM25 a
 | | SQLite | PostgreSQL |
 |---|---|---|
 | Selected by | default | `DATABASE_URL=postgresql://…` |
+| Vector search | in memory | pgvector when installed, otherwise in memory |
 | Connections | one per operation (thread-safe) | psycopg 3 pool |
 | JSON columns | TEXT | JSONB |
 | Migrations | idempotent, on startup | idempotent, on startup, under an advisory lock so concurrent instances don't race |
 
 Stored per session: the owner (a hash of the API key), the message history, each turn's question,
-attachments and full `TurnResult`, and every chunk **with its embedding vector**.
+attachments and full `TurnResult`, and every chunk **with its embedding vector** (as a pgvector
+`vector` when available, raw bytes otherwise).
 
 [`sessions.py`](../web/sessions.py) keeps live agents in an LRU cache (50 by default). The database
 is the source of truth: an evicted session, or any session after a restart, is rebuilt from
-storage on its next request. Stored vectors are reused, so documents aren't re-embedded. Sessions
+storage on its next request. Documents are never re-embedded: stored vectors are either loaded
+(in-memory mode) or left in the database and queried there (pgvector). Sessions
 idle for `SESSION_TTL_DAYS` are purged on startup.
 
 Each session has an `asyncio.Lock`. A second message while one is in progress gets `409`, and
@@ -171,8 +241,12 @@ Pattern matching is a tripwire, not a guarantee; the fencing and prompt do most 
 **Verify citations in code; don't trust the model.** In testing, gpt-oss cited `[report.pdf p.12]`
 in an answer where no tool ran and the PDF had two pages. Prompting reduces this; code guarantees it.
 
-**An async generator as the core interface.** One implementation serves streaming, JSON, evaluation
-and tests. Cancellation is free, because closing the generator runs the rollback path.
+**A LangGraph state machine as the core.** The control flow (route, research, run tools, retry,
+force an answer) is explicit nodes and edges rather than nested loops, so each step can be tested,
+traced in LangSmith as its own span, and rendered as a diagram. Committing history only when the
+graph finishes makes cancellation and failure safe without cleanup code. We deliberately don't use
+a LangGraph checkpointer: sessions already persist in the application database, and a turn is
+short enough that resuming one mid-way isn't worth the storage.
 
 **Hybrid retrieval without PyTorch.** Groq has no embeddings API, and local PyTorch models add
 gigabytes. fastembed's ONNX runtime keeps the Docker image under 1 GB. The evaluation showed why

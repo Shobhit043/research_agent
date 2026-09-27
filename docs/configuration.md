@@ -17,6 +17,8 @@ All settings are environment variables, usually set in `.env` (copy `.env.exampl
 | `USE_EMBEDDINGS` | `true` | Hybrid BM25 + embedding search. `false` uses BM25 only (no model download). |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Any fastembed text model. Changing it only affects newly uploaded documents. |
 | `FASTEMBED_CACHE_PATH` | fastembed's default | Where the embedding model is stored. The Docker image sets `/opt/models`. |
+| `OCR_ENABLED` | `true` | OCR scanned PDF pages and image uploads. With `false`, scans and images are rejected with a clear message. |
+| `OCR_MAX_PAGES` | `30` | Pages OCR'd per document. OCR takes 2–3 s of CPU per page; later scanned pages are skipped with a log warning. |
 | `ENABLED_TOOLS` | all | Comma-separated subset of `search_documents, read_document, web_search, fetch_url, wikipedia_search, arxiv_search, get_time, place_info`. A typo fails at startup. Each bound tool costs about 150 prompt tokens per model call. |
 | `HTTP_USER_AGENT` | `ResearchAssistant/0.4 (self-hosted research tool)` | Sent by the web tools. Include a contact URL or email: Wikipedia and arXiv throttle anonymous clients. |
 
@@ -38,6 +40,8 @@ Command-line flags for `main.py`: `--host`, `--port`, `--no-browser` (don't open
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | none (SQLite) | `postgresql://user:password@host:5432/db` switches to PostgreSQL. |
+| `USE_PGVECTOR` | `true` | With Postgres, run vector search in the database when the pgvector extension is installed. `false` keeps vectors in memory. |
+| `EMBEDDING_DIM` | `384` | Size of the pgvector column; must match `EMBEDDING_MODEL` (384 for `bge-small-en-v1.5`). A mismatch disables pgvector with a warning rather than corrupting the index. |
 | `DATA_DIR` | `data` | SQLite location (`DATA_DIR/assistant.db`). Unused with Postgres. |
 | `SESSION_TTL_DAYS` | `7` | Sessions idle for longer are deleted on startup. |
 | `POSTGRES_PASSWORD` | `assistant` | Used only by `docker-compose.yml` for its database service. Change it. |

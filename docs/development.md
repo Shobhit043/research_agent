@@ -13,7 +13,7 @@ python main.py -v              # verbose: logs routing, tool calls and timings
 
 ```
 agent/                     the research agent; no web dependencies
-  research_agent.py        async streaming core: routing, tool loop, rollback, TurnResult
+  research_agent.py        LangGraph StateGraph: analyze, direct, research, tools, finalize nodes
   prompts.py               system and routing prompts
   schemas.py               QueryAnalysis, TurnResult, AgentEvent and related models
   citations.py             citation verification and source collection
@@ -23,6 +23,7 @@ agent/                     the research agent; no web dependencies
     loader.py              PDF/TXT/MD extraction, cleaning, page-bounded chunking
     store.py               hybrid BM25 + dense index with reciprocal rank fusion
     embeddings.py          fastembed wrapper
+    ocr.py                 RapidOCR engine for scanned pages and images
   tools/
     __init__.py            tool registry, ENABLED_TOOLS, prompt guidance
     http.py                shared HTTP: SSRF guard, redirect checks, retries, TTL cache
@@ -33,7 +34,7 @@ agent/                     the research agent; no web dependencies
 web/
   server.py                FastAPI app: routes, streaming, middleware
   sessions.py              LRU cache of live agents, rebuilt from storage
-  storage.py               SQLite and PostgreSQL backends
+  storage.py               SQLite and PostgreSQL (+ pgvector) backends
   security.py              API-key auth, rate limiting, security headers
   observability.py         request IDs, JSON logging, Prometheus metrics
   config.py                ServerSettings
@@ -47,12 +48,12 @@ Dockerfile, docker-compose.yml, .github/workflows/ci.yml, pyproject.toml
 ## Tests
 
 ```bash
-python -m pytest                     # 141 tests, offline, about 10 s
+python -m pytest                     # 155 tests, offline, about 15 s
 ruff check .                         # lint
 
-# Also run the API tests against PostgreSQL:
+# Also run the API and pgvector tests against PostgreSQL:
 docker run -d --name pg -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test \
-  -e POSTGRES_DB=assistant_test -p 5432:5432 postgres:16-alpine
+  -e POSTGRES_DB=assistant_test -p 5432:5432 pgvector/pgvector:pg16
 TEST_DATABASE_URL=postgresql://test:test@localhost:5432/assistant_test python -m pytest
 ```
 
@@ -61,14 +62,16 @@ Nothing touches the network or needs an API key. The fakes are in [`tests/fakes.
   chunks, usage metadata and errors raised mid-script.
 - `KeywordEmbedder` is a deterministic embedder in which synonyms share a vector.
 - The HTTP tests swap in a fake session and DNS resolver.
+- An autouse `fake_ocr` fixture (in `conftest.py`) replaces the OCR engine, so unit tests never
+  load OCR models. One test marked `real_ocr` runs the real engine on a generated scan (~4 s).
 
 | File | Covers |
 |---|---|
-| `test_agent.py` | Routing, tool loop, parallel calls, duplicates, timeouts, budget exhaustion, gpt-oss error recovery, streaming order, rollback on disconnect, history trimming, injection flags |
+| `test_agent.py` | Graph topology, routing, tool loop, parallel calls, duplicates, timeouts, budget exhaustion, gpt-oss error recovery, streaming order, commit-on-completion and rollback on disconnect, history trimming, injection flags |
 | `test_tools.py` | SSRF blocking (including redirects), fetch, Wikipedia, arXiv, time and place, document reading, the registry |
-| `test_documents.py` | Loaders and error cases, chunking, BM25, hybrid search, vector persistence |
+| `test_documents.py` | Loaders and error cases, OCR (scanned pages, page cap, images, real OCR), chunking, BM25, hybrid search, vector persistence |
 | `test_citations.py` | Citation verification, bracket normalisation, source collection |
-| `test_api.py` | Every endpoint, on SQLite and on PostgreSQL: uploads, streaming, auth and ownership, rate limits, token budget, persistence across restart, migration, health, metrics |
+| `test_api.py` | Every endpoint, on SQLite and on PostgreSQL: uploads (including OCR'd images), streaming, auth and ownership, rate limits, token budget, persistence across restart, migration, health, metrics; with pgvector, dense search from the database, vector backfill, and the dimension-mismatch fallback |
 | `test_eval.py` | Evaluation metrics, report rendering, dataset integrity |
 
 CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs lint and the full suite
